@@ -1,7 +1,7 @@
 import stat
 import dataclasses
 from agents import EntityAgent, UncertainAgent
-from model import Location,GameState, GameAction, WizardMoves, Location, Crystal, Portal, Lava, GameTransitions, Observation, EmptyTile, LocationCounts, LocationDistribution
+from model import Location,GameState, GameAction, WizardMoves, Location, Crystal, Portal, Lava, Wall, GameTransitions, Observation, EmptyTile, LocationCounts, LocationDistribution
 import random
 
 
@@ -52,8 +52,21 @@ class MDP:
         The easiest way to do this will involve sampling.
         """
 
-        #TODO YOUR CODE HERE
-        raise NotImplementedError()
+        """
+        make a new count grid, repeat for that many times,
+        sample a location from source, get the action transition (transition model)
+        count++, normalize at the end, return new distribution
+        """
+
+        count_grid = 2000
+        next_location_counts = LocationCounts(self.game_state.grid_size)
+
+        for _ in range(count_grid):
+            sample_source = source.sample()
+            sample_target = self.transition_model(sample_source, action).sample()
+            next_location_counts.add_count(sample_target)
+
+        return next_location_counts.normalize()
 
 
 class LocationValues:
@@ -70,11 +83,65 @@ class LocationValues:
         Perform one update of value iteration based off of the provided MDP.
         """
 
+        """
+        make new grid, 
+        loop through each locaiton, 
+        make sure to skip walls or lava n portals,
+        make a temp source state with the wizard at that loc, 
+        use gametransition.get_successors for available actions,
+        for each action, get transition distribution, 
+        get q(s,a) by adding all possible next locs,
+        use reward based on the next loc, 
+        add discounted value of next, 
+        set next value to max q(s,a)
+        assign grid to next grid, 
+        return that
+        """
+
         next_value_grid = [[0.0 for _ in range(self.mdp.game_state.grid_size[1])] for _ in range(self.mdp.game_state.grid_size[0])]
 
+        for r in range(self.mdp.game_state.grid_size[0]):
+            for c in range(self.mdp.game_state.grid_size[1]):
+                loc = Location(r, c)
+                tile = self.mdp.game_state.tile_grid[r][c]
 
-        #TODO YOUR CODE HERE, CALCULATE NEXT VALUE AS A FUNCTION OF PREVIOUS VALUE
-        raise NotImplementedError()
+                """ skippin walls, lava n portal"""
+                if isinstance(tile, (Wall, Lava, Portal)):
+                    next_value_grid[r][c] = 0.0
+                    continue
+
+                source_state = self.mdp.game_state.replace_active_entity_location(loc)
+                successors = GameTransitions.get_successors(source_state)
+                if len(successors) == 0:
+                    next_value_grid[r][c] = 0.0
+                    continue
+
+                best_action_value = float("-inf")
+                for action, _ in successors:
+                    transition_dist = self.mdp.transition_model(loc, action)
+                    q_value = 0.0
+
+                    for next_loc in transition_dist.locations():
+                        p = transition_dist.probability(next_loc)
+                        next_tile = self.mdp.game_state.tile_grid[next_loc.row][next_loc.col]
+
+                        if isinstance(next_tile, Lava):
+                            reward = self.mdp.death_reward
+                        elif isinstance(next_tile, Portal):
+                            reward = self.mdp.escape_reward
+                        else:
+                            reward = self.mdp.living_reward
+
+                        q_value += p * (
+                            reward + self.mdp.discount * self.value_grid[next_loc.row][next_loc.col]
+                        )
+
+                    if q_value > best_action_value:
+                        best_action_value = q_value
+
+                next_value_grid[r][c] = best_action_value
+
+        self.value_grid = next_value_grid
 
         return next_value_grid
 
