@@ -182,11 +182,25 @@ class MDPAgent(UncertainAgent):
         #We need to update our belief for all possible locations. So lets start by creating a new distribution
         new_estimate = LocationDistribution.from_game_state_uniform(self.mdp.game_state)
 
-        #The new distribution should be set for each location
+        """
+        make new distribution container, loop thru them locs,
+        get prev from current esitimate, get likelihood from observation likelihood,
+        mult to get unnormalizred next, store it in new estimate
+        renorm so it adds up to 1, save it to current estimate
+        """
+
+        total = 0.0
         for loc in new_estimate.locations():
 
-            #TODO: YOUR CODE HERE
-            raise NotImplementedError()
+            prev = self.current_position_estimate.probability(loc)
+            likelihood = self.observation_likelihood(observation, loc)
+            unnom_next = prev * likelihood
+            new_estimate.update_probability(loc, unnom_next)
+            total += unnom_next
+
+        # If no location is compatible with the observation under current support, keep prior.
+        if total == 0.0:
+            return
 
         new_estimate.renormalize()
         self.current_position_estimate = new_estimate
@@ -209,9 +223,38 @@ class MDPAgent(UncertainAgent):
             # 4. You can find the distribution of the results of an action for a given specific location
             # 5. You can calculate the reward of a specific transition as a result of a specific action with a specific result
             # 6. You have an estimate of the value of each result location
-        #TODO YOUR CODE HERE
-        raise NotImplementedError()
-        action = WizardMoves.RIGHT
+
+        """
+        update the belief from the observations
+        either predict final loc distribution from action
+        or compute expected value of that distribution
+        pick the action with max expected value, return that
+        """
+        action = WizardMoves.STAY
+        best_exp_val = float("-inf")
+
+        for possible_action in WizardMoves:
+            result_distribution = self.mdp.transition_distribution(self.current_position_estimate, possible_action)
+            exp_val = 0.0
+
+            for loc in result_distribution.locations():
+                p = result_distribution.probability(loc)
+                tile = self.mdp.game_state.tile_grid[loc.row][loc.col]
+
+                if isinstance(tile, Lava):
+                    reward = self.mdp.death_reward
+                elif isinstance(tile, Portal):
+                    reward = self.mdp.escape_reward
+                else:
+                    reward = self.mdp.living_reward
+
+                exp_val += p * (
+                    reward + self.mdp.discount * self.values.value_grid[loc.row][loc.col]
+                )
+
+            if exp_val > best_exp_val:
+                best_exp_val = exp_val
+                action = possible_action
 
         #When choosing an action, we must update our prior to account for the new distribution as a result of the action being taken
         self.update_prior(action)
