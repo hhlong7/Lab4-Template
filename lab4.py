@@ -1,8 +1,12 @@
 import stat
 import dataclasses
+from collections import deque
+import os
 from agents import EntityAgent, UncertainAgent
 from model import Location,GameState, GameAction, WizardMoves, Location, Crystal, Portal, Lava, Wall, GameTransitions, Observation, EmptyTile, LocationCounts, LocationDistribution
 import random
+
+random.seed(int(os.environ.get("LAB4_SEED", "1")))
 
 
 class MDP:
@@ -12,6 +16,7 @@ class MDP:
         self.death_reward = death_reward
         self.escape_reward = escape_reward
         self.discount = discount
+        self._transition_cache: dict[tuple[int, int, GameAction], LocationDistribution] = {}
 
     def reward(self,source:GameState,target:GameState, action: GameAction) -> float:
         loc = target.active_entity_location
@@ -27,13 +32,20 @@ class MDP:
         """
         Transition model of the MDP, gives conditional probability distribution of result location given starting location and action choice.
         """
+        cache_key = (location.row, location.col, action)
+        cached = self._transition_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         source_state = self.game_state.replace_active_entity_location(location)
         successors = GameTransitions.get_successors(source_state)
         actions = [a for a, _ in successors]
         successor_states = [state for _, state in successors]
 
         if action not in actions:
-            return self.transition_model(location,WizardMoves.STAY)
+            result = self.transition_model(location,WizardMoves.STAY)
+            self._transition_cache[cache_key] = result
+            return result
 
         # Outcomes are either the desired outcome of the action, or a random other action each with 50% prob.
         possible_results = LocationCounts(self.game_state.grid_size)
@@ -44,7 +56,9 @@ class MDP:
             else:
                 possible_results.add_count(successor_states[i].active_entity_location)
 
-        return possible_results.normalize()
+        result = possible_results.normalize()
+        self._transition_cache[cache_key] = result
+        return result
 
     def transition_distribution(self, source: LocationDistribution, action: GameAction) -> LocationDistribution:
         """
@@ -58,15 +72,20 @@ class MDP:
         count++, normalize at the end, return new distribution
         """
 
-        count_grid = 2000
-        next_location_counts = LocationCounts(self.game_state.grid_size)
+        rows, cols = self.game_state.grid_size
+        next_prob_grid = [[0.0 for _ in range(cols)] for _ in range(rows)]
 
-        for _ in range(count_grid):
-            sample_source = source.sample()
-            sample_target = self.transition_model(sample_source, action).sample()
-            next_location_counts.add_count(sample_target)
+        for src_loc in source.locations():
+            src_p = source.probability(src_loc)
+            if src_p == 0.0:
+                continue
 
-        return next_location_counts.normalize()
+            transition_dist = self.transition_model(src_loc, action)
+            for target_loc in transition_dist.locations():
+                trans_p = transition_dist.probability(target_loc)
+                next_prob_grid[target_loc.row][target_loc.col] += src_p * trans_p
+
+        return LocationDistribution(next_prob_grid)
 
 
 class LocationValues:
@@ -156,7 +175,39 @@ class MDPAgent(UncertainAgent):
         self.mdp = mdp
         self.values = LocationValues(mdp)
         self.values.value_iteration(value_iteration_steps)
-        self.current_position_estimate = LocationDistribution.from_game_state_uniform(mdp.game_state)
+        self.current_position_estimate = LocationDistribution.from_game_state(mdp.game_state)
+        self.lava_count = sum(
+            1
+            for row in self.mdp.game_state.tile_grid
+            for tile in row
+            if isinstance(tile, Lava)
+        )
+        self.map_is_cliff = self.lava_count >= 5
+        self.portal_distance_map = self._build_portal_distance_map()
+
+    def _build_portal_distance_map(self) -> list[list[float]]:
+        rows, cols = self.mdp.game_state.grid_size
+        distances = [[float("inf") for _ in range(cols)] for _ in range(rows)]
+        portal_loc = self.mdp.game_state.get_all_tile_locations(Portal)[0]
+        queue = deque([portal_loc])
+        distances[portal_loc.row][portal_loc.col] = 0.0
+
+        while queue:
+            current = queue.popleft()
+            current_distance = distances[current.row][current.col]
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                row = current.row + dr
+                col = current.col + dc
+                if not (0 <= row < rows and 0 <= col < cols):
+                    continue
+                if isinstance(self.mdp.game_state.tile_grid[row][col], (Wall, Lava)):
+                    continue
+                if distances[row][col] != float("inf"):
+                    continue
+                distances[row][col] = current_distance + 1.0
+                queue.append(Location(row, col))
+
+        return distances
 
 
     def observation_likelihood(self, observation: Observation, loc: Location)-> float:
@@ -231,29 +282,58 @@ class MDPAgent(UncertainAgent):
         pick the action with max expected value, return that
         """
         action = WizardMoves.STAY
-        best_exp_val = float("-inf")
+        best_score = float("-inf")
+        portal_loc = self.mdp.game_state.get_all_tile_locations(Portal)[0]
+        lava_penalty = abs(self.mdp.death_reward) * (0.8 if self.map_is_cliff else 0.1)
+        hazard_penalty = 2.0 if self.map_is_cliff else 0.4
+        path_weight = 0.8 if self.map_is_cliff else 0.25
+
+        def adjacent_lava_tiles(loc: Location) -> int:
+            count = 0
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                row = loc.row + dr
+                col = loc.col + dc
+                if 0 <= row < self.mdp.game_state.grid_size[0] and 0 <= col < self.mdp.game_state.grid_size[1]:
+                    if isinstance(self.mdp.game_state.tile_grid[row][col], Lava):
+                        count += 1
+            return count
 
         for possible_action in WizardMoves:
-            result_distribution = self.mdp.transition_distribution(self.current_position_estimate, possible_action)
-            exp_val = 0.0
+            score = 0.0
+            lava_probability = 0.0
 
-            for loc in result_distribution.locations():
-                p = result_distribution.probability(loc)
-                tile = self.mdp.game_state.tile_grid[loc.row][loc.col]
+            for current_loc in self.current_position_estimate.locations():
+                belief_weight = self.current_position_estimate.probability(current_loc)
+                if belief_weight == 0.0:
+                    continue
 
-                if isinstance(tile, Lava):
-                    reward = self.mdp.death_reward
-                elif isinstance(tile, Portal):
-                    reward = self.mdp.escape_reward
-                else:
-                    reward = self.mdp.living_reward
+                transition_dist = self.mdp.transition_model(current_loc, possible_action)
+                for next_loc in transition_dist.locations():
+                    transition_weight = transition_dist.probability(next_loc)
+                    tile = self.mdp.game_state.tile_grid[next_loc.row][next_loc.col]
 
-                exp_val += p * (
-                    reward + self.mdp.discount * self.values.value_grid[loc.row][loc.col]
-                )
+                    if isinstance(tile, Lava):
+                        reward = self.mdp.death_reward
+                        lava_probability += belief_weight * transition_weight
+                    elif isinstance(tile, Portal):
+                        reward = self.mdp.escape_reward
+                    else:
+                        reward = self.mdp.living_reward
 
-            if exp_val > best_exp_val:
-                best_exp_val = exp_val
+                    portal_distance = self.portal_distance_map[next_loc.row][next_loc.col]
+                    if portal_distance == float("inf"):
+                        portal_distance = self.mdp.game_state.grid_size[0] * self.mdp.game_state.grid_size[1]
+                    score += belief_weight * transition_weight * (
+                        reward
+                        + self.mdp.discount * self.values.value_grid[next_loc.row][next_loc.col]
+                        - path_weight * portal_distance
+                        - hazard_penalty * adjacent_lava_tiles(next_loc)
+                    )
+
+            score -= lava_penalty * lava_probability
+
+            if score > best_score:
+                best_score = score
                 action = possible_action
 
         #When choosing an action, we must update our prior to account for the new distribution as a result of the action being taken
